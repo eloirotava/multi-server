@@ -169,7 +169,9 @@ impl Supervisor {
             .enumerate()
             .find(|(_, route)| route.matches(request.uri().path()))
         {
-            site.runtime_key = site.directory.join(format!(".multi-server-route-{index}"));
+            site.runtime_key = site
+                .manifest_directory
+                .join(format!(".multi-server-route-{index}"));
             site.manifest.serve = route.serve.clone();
         }
         match &site.manifest.serve {

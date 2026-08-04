@@ -10,6 +10,8 @@ pub struct Manifest {
     pub version: u32,
     #[serde(default)]
     pub domains: Domains,
+    #[serde(default = "default_site_root")]
+    pub site_root: String,
     pub serve: Serve,
     #[serde(default)]
     pub routes: Vec<Route>,
@@ -26,6 +28,8 @@ pub struct Manifest {
 pub struct Domains {
     #[serde(default)]
     pub subdomains: bool,
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -203,6 +207,18 @@ impl Manifest {
         if manifest.prepare.iter().any(Vec::is_empty) {
             bail!("prepare commands cannot be empty");
         }
+        if manifest.site_root.trim().is_empty() {
+            bail!("site_root cannot be empty");
+        }
+        if manifest.domains.aliases.iter().any(|alias| {
+            alias.is_empty()
+                || alias.contains('/')
+                || alias.contains('\\')
+                || alias.contains(':')
+                || alias.chars().any(char::is_whitespace)
+        }) {
+            bail!("domain aliases must be plain host names without ports");
+        }
         if let Serve::Http { port: Some(0), .. } = &manifest.serve {
             bail!("serve.port must be between 1 and 65535");
         }
@@ -266,6 +282,9 @@ const fn manifest_version() -> u32 {
 }
 fn default_public() -> String {
     "public".into()
+}
+fn default_site_root() -> String {
+    ".".into()
 }
 fn default_indexes() -> Vec<String> {
     vec!["index.html".into()]

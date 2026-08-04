@@ -12,26 +12,25 @@ The repository includes ready-to-run examples under [`sites/`](sites/README.md),
 
 ## Optimized Alpine amd64 build
 
-The release profile enables full LTO, a single code-generation unit, abort-on-panic, optimization level 3, and symbol stripping. The repository also fixes the build target to `x86_64-unknown-linux-musl` with the static C runtime enabled. The resulting `multi-server` executable does not depend on the destination machine's musl, glibc, or other shared libraries.
+The release profile enables full LTO, a single code-generation unit, abort-on-panic, optimization level 3, and symbol stripping. Development commands such as `cargo run` intentionally use the installed host target. Alpine's packaged Rust may report `x86_64-alpine-linux-musl`, while Rustup uses the official `x86_64-unknown-linux-musl` target name; globally forcing either one breaks the other toolchain.
 
-On an amd64 Alpine machine, such as the environment used by PicoIDE, use a Rustup toolchain, install the native build tools, and compile with:
+On an amd64 Alpine machine, such as the environment used by PicoIDE, install the native build tools and use the build helper. It detects the host triple, cross-compiles only when necessary, rejects an ELF dynamic interpreter, and copies the verified result to `dist/multi-server`:
 
 ```sh
 apk add --no-cache build-base
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+./scripts/build-static-alpine.sh
 ```
 
 The deployable executable is:
 
 ```text
-target/x86_64-unknown-linux-musl/release/multi-server
+dist/multi-server
 ```
 
 Confirm its architecture, size, and linkage before copying it:
 
 ```sh
-BIN=target/x86_64-unknown-linux-musl/release/multi-server
+BIN=dist/multi-server
 file "$BIN"
 du -h "$BIN"
 ldd "$BIN" 2>&1 || true
@@ -45,22 +44,20 @@ The default profile prioritizes runtime performance. If binary size matters more
 
 ```sh
 CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
-  cargo build --release --target x86_64-unknown-linux-musl
+  ./scripts/build-static-alpine.sh
 ```
 
 Do not set `-C target-cpu=native` when the binary may be moved to another amd64 machine: it can emit instructions unavailable on the destination CPU. If compilation and execution always happen on the same machine, an optional machine-specific build is:
 
 ```sh
-RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=native" \
-  cargo build --release --target x86_64-unknown-linux-musl
+RUSTFLAGS="-C target-cpu=native" \
+  ./scripts/build-static-alpine.sh
 ```
 
 To install the optimized executable and keep the `sites` directory in a persistent location:
 
 ```sh
-install -Dm755 \
-  target/x86_64-unknown-linux-musl/release/multi-server \
-  /usr/local/bin/multi-server
+install -Dm755 dist/multi-server /usr/local/bin/multi-server
 install -d /var/lib/multi-server/sites
 multi-server --root /var/lib/multi-server/sites --listen 127.0.0.1:8080
 ```
@@ -79,6 +76,22 @@ Create `sites/eloi.rotava.com/site.json`:
   },
   "lifecycle": {
     "idle_timeout_seconds": 60
+  }
+}
+```
+
+The manifest does not have to serve files from its own directory. `site_root` may be relative to the manifest directory or an absolute path. Additional host names can point to the same manifest with `domains.aliases`:
+
+```json
+{
+  "version": 1,
+  "site_root": "/srv/shared/eloi-site",
+  "domains": {
+    "aliases": ["www.eloi.rotava.com", "eloi.example.com"]
+  },
+  "serve": {
+    "mode": "static",
+    "root": "public"
   }
 }
 ```

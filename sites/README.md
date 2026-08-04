@@ -33,6 +33,7 @@ These folders are examples of the generic manifest contract. Flask and FastAPI r
 | `activity.localhost` | Only `/hls/` and `/publish/` renew the idle timeout |
 | `rust.localhost` | Building and executing a dependency-free Rust HTTP binary |
 | `wordpress.localhost` | Ordered static routes plus FastCGI/front-controller and wildcard subdomains |
+| `alias.localhost` | A manifest whose files live elsewhere and two additional domain aliases |
 
 Test a static byte range and conditional cache response:
 
@@ -76,3 +77,11 @@ curl -H 'Host: wordpress.localhost' http://127.0.0.1:8080/assets/example.css
 ```
 
 See [`wordpress.localhost/README.md`](wordpress.localhost/README.md) for replacing the diagnostic files with a real WordPress Multisite tree.
+
+`alias.localhost` has no page files of its own: `site_root` points to the existing `static.localhost` directory. All three hosts below resolve to that same content:
+
+```sh
+curl -H 'Host: alias.localhost' http://127.0.0.1:8080/
+curl -H 'Host: www.alias.localhost' http://127.0.0.1:8080/
+curl -H 'Host: shared-static.localhost' http://127.0.0.1:8080/
+```
