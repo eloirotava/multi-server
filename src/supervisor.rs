@@ -70,7 +70,13 @@ impl Drop for RequestActivity {
 enum Phase {
     Stopped,
     Starting,
-    Running { port: u16, child: Child },
+    Running { upstream: Upstream, child: Child },
+}
+
+#[derive(Clone, Debug)]
+struct Upstream {
+    host: String,
+    port: u16,
 }
 
 impl Supervisor {
@@ -106,9 +112,9 @@ impl Supervisor {
         request: Request<Body>,
     ) -> anyhow::Result<Response<Body>> {
         let service = self.service_for(&site.directory).await;
-        let port = ensure_running(service.clone(), &site).await?;
+        let upstream = ensure_running(service.clone(), &site).await?;
         let activity = RequestActivity::begin(service).await;
-        self.proxy_to_port(port, request, activity).await
+        self.proxy_to_upstream(&upstream, request, activity).await
     }
 
     async fn stdio(
@@ -139,15 +145,17 @@ impl Supervisor {
             .clone()
     }
 
-    async fn proxy_to_port(
+    async fn proxy_to_upstream(
         &self,
-        port: u16,
+        upstream: &Upstream,
         request: Request<Body>,
         activity: RequestActivity,
     ) -> anyhow::Result<Response<Body>> {
         let (parts, body) = request.into_parts();
         let url = format!(
-            "http://127.0.0.1:{port}{}",
+            "http://{}:{}{}",
+            upstream.host,
+            upstream.port,
             parts
                 .uri
                 .path_and_query()
@@ -207,15 +215,15 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
-async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::Result<u16> {
+async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::Result<Upstream> {
     loop {
         let notified = service.changed.notified();
         let mut state = service.state.lock().await;
         state.last_activity = Instant::now();
         match &mut state.phase {
-            Phase::Running { port, child } => {
+            Phase::Running { upstream, child } => {
                 if child.try_wait()?.is_none() {
-                    return Ok(*port);
+                    return Ok(upstream.clone());
                 }
                 warn!(domain = %site.domain, "site process exited; restarting");
                 state.phase = Phase::Stopped;
@@ -237,13 +245,16 @@ async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::R
                 .await;
                 let mut state = service.state.lock().await;
                 match started {
-                    Ok((port, child)) => {
+                    Ok((upstream, child)) => {
                         state.prepared = true;
-                        state.phase = Phase::Running { port, child };
+                        state.phase = Phase::Running {
+                            upstream: upstream.clone(),
+                            child,
+                        };
                         state.last_activity = Instant::now();
                         service.changed.notify_waiters();
                         spawn_idle_reaper(service.clone(), site.clone());
-                        return Ok(port);
+                        return Ok(upstream);
                     }
                     Err(error) => {
                         state.phase = Phase::Stopped;
@@ -405,30 +416,51 @@ fn parse_cgi_response(output: &[u8]) -> anyhow::Result<Response<Body>> {
     Ok(builder.body(Body::from(output[header_end + separator_len..].to_vec()))?)
 }
 
-async fn start_process(site: &ResolvedSite) -> anyhow::Result<(u16, Child)> {
+async fn start_process(site: &ResolvedSite) -> anyhow::Result<(Upstream, Child)> {
     let Serve::Http {
         command,
         environment,
         working_directory,
         port_environment,
+        port,
+        upstream_host,
         startup_timeout_seconds,
     } = &site.manifest.serve
     else {
         bail!("not an HTTP service");
     };
-    let socket = TcpListener::bind("127.0.0.1:0").await?;
-    let port = socket.local_addr()?.port();
-    drop(socket);
-    let mut process = Command::new(&command[0]);
+    let selected_port = match port {
+        Some(port) => *port,
+        None => {
+            let socket = TcpListener::bind("127.0.0.1:0").await?;
+            let port = socket.local_addr()?.port();
+            drop(socket);
+            port
+        }
+    };
+    let variables = RuntimeVariables {
+        port: selected_port,
+        domain: &site.domain,
+        site_root: &site.directory,
+    };
+    let expanded_command = command
+        .iter()
+        .map(|value| expand_runtime_variables(value, &variables))
+        .collect::<Vec<_>>();
+    let mut process = Command::new(&expanded_command[0]);
     process
-        .args(&command[1..])
+        .args(&expanded_command[1..])
         .current_dir(
             working_directory
                 .as_ref()
                 .map_or(site.directory.clone(), |dir| site.directory.join(dir)),
         )
-        .envs(environment)
-        .env(port_environment, port.to_string())
+        .envs(
+            environment
+                .iter()
+                .map(|(name, value)| (name, expand_runtime_variables(value, &variables))),
+        )
+        .env(port_environment, selected_port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -436,10 +468,14 @@ async fn start_process(site: &ResolvedSite) -> anyhow::Result<(u16, Child)> {
     let child = process
         .spawn()
         .with_context(|| format!("failed to start {}", command[0]))?;
+    let upstream = Upstream {
+        host: expand_runtime_variables(upstream_host, &variables),
+        port: selected_port,
+    };
     let timeout = Duration::from_secs(*startup_timeout_seconds);
     tokio::time::timeout(timeout, async {
         loop {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            if tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port))
                 .await
                 .is_ok()
             {
@@ -449,9 +485,27 @@ async fn start_process(site: &ResolvedSite) -> anyhow::Result<(u16, Child)> {
         }
     })
     .await
-    .with_context(|| format!("site did not listen on port {port} within {timeout:?}"))?;
-    info!(domain = %site.domain, port, "site process started");
-    Ok((port, child))
+    .with_context(|| {
+        format!(
+            "site did not listen on {}:{} within {timeout:?}",
+            upstream.host, upstream.port
+        )
+    })?;
+    info!(domain = %site.domain, host = %upstream.host, port = upstream.port, "site process started");
+    Ok((upstream, child))
+}
+
+struct RuntimeVariables<'a> {
+    port: u16,
+    domain: &'a str,
+    site_root: &'a Path,
+}
+
+fn expand_runtime_variables(value: &str, variables: &RuntimeVariables<'_>) -> String {
+    value
+        .replace("${PORT}", &variables.port.to_string())
+        .replace("${DOMAIN}", variables.domain)
+        .replace("${SITE_ROOT}", &variables.site_root.to_string_lossy())
 }
 
 fn spawn_idle_reaper(service: Arc<Service>, site: ResolvedSite) {
@@ -574,5 +628,22 @@ mod tests {
         assert!(!headers.contains_key("keep-alive"));
         assert!(!headers.contains_key("x-internal"));
         assert_eq!(headers["x-forwarded-test"], "kept");
+    }
+
+    #[test]
+    fn expands_generic_runtime_variables() {
+        let root = Path::new("/raiz/example.com");
+        let variables = RuntimeVariables {
+            port: 32123,
+            domain: "example.com",
+            site_root: root,
+        };
+        assert_eq!(
+            expand_runtime_variables(
+                "${SITE_ROOT}/server --domain=${DOMAIN} --port=${PORT}",
+                &variables
+            ),
+            "/raiz/example.com/server --domain=example.com --port=32123"
+        );
     }
 }

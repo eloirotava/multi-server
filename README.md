@@ -30,6 +30,24 @@ The application must listen on `127.0.0.1:$PORT`. Then request it through the ro
 curl -H 'Host: eloi.rotava.com' http://127.0.0.1:8080/
 ```
 
+`${PORT}`, `${DOMAIN}`, and `${SITE_ROOT}` are expanded in HTTP command arguments, environment values, and the upstream host. This keeps the supervisor language-agnostic and also permits a generic container command to map a dynamically allocated host port to an application's hard-coded internal port:
+
+```json
+{
+  "version": 1,
+  "serve": {
+    "mode": "http",
+    "command": [
+      "podman", "run", "--rm",
+      "-p", "127.0.0.1:${PORT}:8080",
+      "my-copied-application"
+    ]
+  }
+}
+```
+
+Multiple applications may therefore use port `8080` internally while the supervisor routes each domain to a different dynamic host port. For an application already listening on a unique host port, set `"port": 8080`; dynamic allocation remains the default.
+
 Static sites use a smaller manifest:
 
 ```json
@@ -60,4 +78,4 @@ Short-lived programs can use `"mode": "stdio"`. A process is started for every r
 
 This version supports static files, per-request stdio/CGI programs, preparation commands, and HTTP applications with dynamically assigned ports. Proxied request and response bodies are streamed rather than buffered in memory. Long HTTP ingestion requests and repeated HLS segment requests count as activity, so an HTTP media process remains alive until both stop and its idle timeout expires.
 
-Network namespaces for applications with colliding hard-coded ports are not implemented yet. TLS, WebSocket upgrades, graceful process-group shutdown, automatic reload after file changes, and precise HLS publisher/viewer probes are also planned follow-up capabilities.
+Native network namespace creation is not implemented yet; container commands can already provide equivalent isolation without making the supervisor aware of a language or framework. TLS is intentionally outside the current scope because the service is designed to listen behind a local Cloudflare Tunnel. WebSocket upgrades, graceful process-group shutdown, automatic reload after file changes, and precise activity probes are planned follow-up capabilities.

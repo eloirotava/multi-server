@@ -41,6 +41,11 @@ pub enum Serve {
         working_directory: Option<String>,
         #[serde(default = "default_port_environment")]
         port_environment: String,
+        /// Use a predetermined host port instead of allocating one dynamically.
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default = "default_upstream_host")]
+        upstream_host: String,
         #[serde(default = "default_startup_timeout")]
         startup_timeout_seconds: u64,
     },
@@ -90,6 +95,14 @@ impl Manifest {
         if manifest.prepare.iter().any(Vec::is_empty) {
             bail!("prepare commands cannot be empty");
         }
+        if let Serve::Http { port: Some(0), .. } = &manifest.serve {
+            bail!("serve.port must be between 1 and 65535");
+        }
+        if let Serve::Http { upstream_host, .. } = &manifest.serve {
+            if upstream_host.trim().is_empty() {
+                bail!("serve.upstream_host cannot be empty");
+            }
+        }
         Ok(manifest)
     }
 }
@@ -105,6 +118,9 @@ fn default_indexes() -> Vec<String> {
 }
 fn default_port_environment() -> String {
     "PORT".into()
+}
+fn default_upstream_host() -> String {
+    "127.0.0.1".into()
 }
 const fn default_startup_timeout() -> u64 {
     15
