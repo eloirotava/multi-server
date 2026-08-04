@@ -10,6 +10,53 @@ cargo run -- --root ./sites --listen 127.0.0.1:8080
 
 The repository includes ready-to-read examples under [`sites/`](sites/README.md): a static site, a per-request shell script, Flask, and FastAPI/Uvicorn.
 
+## Optimized Alpine amd64 build
+
+The release profile enables full LTO, a single code-generation unit, abort-on-panic, optimization level 3, and symbol stripping. It favors a small, fast deployment binary over build speed.
+
+On an amd64 Alpine machine, such as the environment used by PicoIDE, install the native build tools and compile with:
+
+```sh
+apk add --no-cache build-base cargo rust
+cargo build --release
+```
+
+The deployable executable is:
+
+```text
+target/release/multi-server
+```
+
+Confirm its architecture, size, and linkage before copying it:
+
+```sh
+file target/release/multi-server
+du -h target/release/multi-server
+ldd target/release/multi-server || true
+```
+
+The default profile prioritizes runtime performance. If binary size matters more, override the optimization level for that build:
+
+```sh
+CARGO_PROFILE_RELEASE_OPT_LEVEL=z cargo build --release
+```
+
+Do not set `-C target-cpu=native` when the binary may be moved to another amd64 machine: it can emit instructions unavailable on the destination CPU. If compilation and execution always happen on the same machine, an optional machine-specific build is:
+
+```sh
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+To install the optimized executable and keep the `sites` directory in a persistent location:
+
+```sh
+install -Dm755 target/release/multi-server /usr/local/bin/multi-server
+install -d /var/lib/multi-server/sites
+multi-server --root /var/lib/multi-server/sites --listen 127.0.0.1:8080
+```
+
+Point `cloudflared` at `http://127.0.0.1:8080`. TLS terminates at the tunnel, so `multi-server` only needs to listen on local HTTP.
+
 Create `sites/eloi.rotava.com/site.json`:
 
 ```json
