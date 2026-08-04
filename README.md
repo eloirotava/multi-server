@@ -8,7 +8,7 @@
 cargo run -- --root ./sites --listen 127.0.0.1:8080
 ```
 
-The repository includes ready-to-read examples under [`sites/`](sites/README.md): a static site, a per-request shell script, Flask, and FastAPI/Uvicorn.
+The repository includes ready-to-run examples under [`sites/`](sites/README.md), covering static and range requests, stdio scripts, Flask, FastAPI/Uvicorn, WebSockets, limits, health checks, process groups, activity policies, network namespaces, and a compiled Rust executable.
 
 ## Optimized Alpine amd64 build
 

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "serve": {
+    "mode": "http",
+    "command": ["sh", "start.sh"],
+    "readiness": { "mode": "http", "path": "/health", "status": 200 }
+  },
+  "lifecycle": {
+    "idle_timeout_seconds": 10,
+    "shutdown_grace_seconds": 3
+  }
+}

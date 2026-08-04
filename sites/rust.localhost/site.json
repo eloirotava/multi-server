@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "prepare": [["cargo", "build", "--release"]],
+  "serve": {
+    "mode": "http",
+    "command": ["target/x86_64-unknown-linux-musl/release/example-rust-site"]
+  },
+  "lifecycle": { "idle_timeout_seconds": 30 }
+}

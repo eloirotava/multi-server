@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "serve": {
+    "mode": "stdio",
+    "command": ["sh", "page.sh"],
+    "timeout_seconds": 5
+  },
+  "limits": {
+    "request_body_bytes": 32,
+    "stdio_output_bytes": 1024,
+    "max_concurrent_requests": 1
+  }
+}
