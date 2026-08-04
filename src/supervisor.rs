@@ -38,6 +38,7 @@ struct ServiceState {
     phase: Phase,
     last_activity: Instant,
     active_requests: usize,
+    prepared: bool,
 }
 
 enum Phase {
@@ -69,6 +70,7 @@ impl Supervisor {
                 serve_static(&site.directory, root, index, request.uri().path()).await
             }
             Serve::Http { .. } => self.proxy(site, request).await,
+            Serve::Stdio { .. } => self.stdio(site, request).await,
         }
     }
 
@@ -77,22 +79,7 @@ impl Supervisor {
         site: ResolvedSite,
         request: Request<Body>,
     ) -> anyhow::Result<Response<Body>> {
-        let service = {
-            let mut services = self.services.lock().await;
-            services
-                .entry(site.directory.clone())
-                .or_insert_with(|| {
-                    Arc::new(Service {
-                        state: Mutex::new(ServiceState {
-                            phase: Phase::Stopped,
-                            last_activity: Instant::now(),
-                            active_requests: 0,
-                        }),
-                        changed: Notify::new(),
-                    })
-                })
-                .clone()
-        };
+        let service = self.service_for(&site.directory).await;
         let port = ensure_running(service.clone(), &site).await?;
         {
             let mut state = service.state.lock().await;
@@ -106,6 +93,34 @@ impl Supervisor {
             state.last_activity = Instant::now();
         }
         result
+    }
+
+    async fn stdio(
+        &self,
+        site: ResolvedSite,
+        request: Request<Body>,
+    ) -> anyhow::Result<Response<Body>> {
+        let service = self.service_for(&site.directory).await;
+        ensure_prepared(service, &site).await?;
+        run_stdio(&site, request).await
+    }
+
+    async fn service_for(&self, directory: &Path) -> Arc<Service> {
+        let mut services = self.services.lock().await;
+        services
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| {
+                Arc::new(Service {
+                    state: Mutex::new(ServiceState {
+                        phase: Phase::Stopped,
+                        last_activity: Instant::now(),
+                        active_requests: 0,
+                        prepared: false,
+                    }),
+                    changed: Notify::new(),
+                })
+            })
+            .clone()
     }
 
     async fn proxy_to_port(
@@ -144,6 +159,7 @@ impl Supervisor {
 
 async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::Result<u16> {
     loop {
+        let notified = service.changed.notified();
         let mut state = service.state.lock().await;
         state.last_activity = Instant::now();
         match &mut state.phase {
@@ -156,15 +172,23 @@ async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::R
             }
             Phase::Starting => {
                 drop(state);
-                service.changed.notified().await;
+                notified.await;
             }
             Phase::Stopped => {
                 state.phase = Phase::Starting;
+                let needs_prepare = !state.prepared;
                 drop(state);
-                let started = start_process(site).await;
+                let started = async {
+                    if needs_prepare {
+                        prepare_site(site).await?;
+                    }
+                    start_process(site).await
+                }
+                .await;
                 let mut state = service.state.lock().await;
                 match started {
                     Ok((port, child)) => {
+                        state.prepared = true;
                         state.phase = Phase::Running { port, child };
                         state.last_activity = Instant::now();
                         service.changed.notify_waiters();
@@ -180,6 +204,155 @@ async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::R
             }
         }
     }
+}
+
+async fn ensure_prepared(service: Arc<Service>, site: &ResolvedSite) -> anyhow::Result<()> {
+    loop {
+        let notified = service.changed.notified();
+        let mut state = service.state.lock().await;
+        if state.prepared {
+            return Ok(());
+        }
+        match &state.phase {
+            Phase::Starting => {
+                drop(state);
+                notified.await;
+            }
+            Phase::Stopped => {
+                state.phase = Phase::Starting;
+                drop(state);
+                let prepared = prepare_site(site).await;
+                let mut state = service.state.lock().await;
+                state.phase = Phase::Stopped;
+                if prepared.is_ok() {
+                    state.prepared = true;
+                }
+                service.changed.notify_waiters();
+                return prepared;
+            }
+            Phase::Running { .. } => bail!("invalid running state for stdio site"),
+        }
+    }
+}
+
+async fn prepare_site(site: &ResolvedSite) -> anyhow::Result<()> {
+    for command in &site.manifest.prepare {
+        info!(domain = %site.domain, command = ?command, "preparing site");
+        let status = Command::new(&command[0])
+            .args(&command[1..])
+            .current_dir(&site.directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .with_context(|| format!("failed to run prepare command {}", command[0]))?;
+        if !status.success() {
+            bail!("prepare command {} exited with {status}", command[0]);
+        }
+    }
+    Ok(())
+}
+
+async fn run_stdio(site: &ResolvedSite, request: Request<Body>) -> anyhow::Result<Response<Body>> {
+    let Serve::Stdio {
+        command,
+        environment,
+        working_directory,
+        timeout_seconds,
+    } = &site.manifest.serve
+    else {
+        bail!("not a stdio service");
+    };
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, usize::MAX)
+        .await
+        .context("failed to read request body")?;
+    let mut process = Command::new(&command[0]);
+    process
+        .args(&command[1..])
+        .current_dir(
+            working_directory
+                .as_ref()
+                .map_or(site.directory.clone(), |dir| site.directory.join(dir)),
+        )
+        .envs(environment)
+        .env("REQUEST_METHOD", parts.method.as_str())
+        .env("REQUEST_PATH", parts.uri.path())
+        .env("QUERY_STRING", parts.uri.query().unwrap_or_default())
+        .env("HTTP_HOST", &site.domain)
+        .env("CONTENT_LENGTH", body.len().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    for (name, value) in &parts.headers {
+        if let Ok(value) = value.to_str() {
+            let name = format!(
+                "HTTP_{}",
+                name.as_str().to_ascii_uppercase().replace('-', "_")
+            );
+            process.env(name, value);
+        }
+    }
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("failed to start {}", command[0]))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(&body)
+            .await
+            .context("failed to write request body to site")?;
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(*timeout_seconds),
+        child.wait_with_output(),
+    )
+    .await
+    .context("stdio site timed out")??;
+    if !output.status.success() {
+        bail!("stdio site exited with {}", output.status);
+    }
+    parse_cgi_response(&output.stdout)
+}
+
+fn parse_cgi_response(output: &[u8]) -> anyhow::Result<Response<Body>> {
+    let split = output
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| (at, 4))
+        .or_else(|| {
+            output
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|at| (at, 2))
+        });
+    let Some((header_end, separator_len)) = split else {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(output.to_vec()))?);
+    };
+    let headers = std::str::from_utf8(&output[..header_end])
+        .context("stdio response headers are not UTF-8")?;
+    let mut builder = Response::builder().status(StatusCode::OK);
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            bail!("invalid stdio response header");
+        };
+        if name.eq_ignore_ascii_case("status") {
+            let status = value
+                .split_whitespace()
+                .next()
+                .context("empty Status header")?
+                .parse::<u16>()?;
+            builder = builder.status(status);
+        } else {
+            builder = builder.header(name.trim(), value.trim());
+        }
+    }
+    Ok(builder.body(Body::from(output[header_end + separator_len..].to_vec()))?)
 }
 
 async fn start_process(site: &ResolvedSite) -> anyhow::Result<(u16, Child)> {
@@ -307,4 +480,30 @@ fn response(status: StatusCode, body: &'static str) -> Response<Body> {
         .status(status)
         .body(Body::from(body))
         .expect("valid response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cgi_headers_and_status() {
+        let response = parse_cgi_response(
+            b"Status: 201 Created\r\nContent-Type: text/plain\r\nX-Site: test\r\n\r\ncreated",
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+        assert_eq!(response.headers()["x-site"], "test");
+    }
+
+    #[test]
+    fn treats_headerless_output_as_html() {
+        let response = parse_cgi_response(b"<h1>Hello</h1>").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+    }
 }

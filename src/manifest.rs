@@ -12,6 +12,8 @@ pub struct Manifest {
     pub domains: Domains,
     pub serve: Serve,
     #[serde(default)]
+    pub prepare: Vec<Vec<String>>,
+    #[serde(default)]
     pub lifecycle: Lifecycle,
 }
 
@@ -42,6 +44,15 @@ pub enum Serve {
         #[serde(default = "default_startup_timeout")]
         startup_timeout_seconds: u64,
     },
+    Stdio {
+        command: Vec<String>,
+        #[serde(default)]
+        environment: HashMap<String, String>,
+        #[serde(default)]
+        working_directory: Option<String>,
+        #[serde(default = "default_request_timeout")]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -69,10 +80,15 @@ impl Manifest {
         if manifest.version != 1 {
             bail!("unsupported manifest version {}", manifest.version);
         }
-        if let Serve::Http { command, .. } = &manifest.serve {
-            if command.is_empty() {
-                bail!("serve.command cannot be empty");
-            }
+        let command = match &manifest.serve {
+            Serve::Http { command, .. } | Serve::Stdio { command, .. } => Some(command),
+            Serve::Static { .. } => None,
+        };
+        if command.is_some_and(Vec::is_empty) {
+            bail!("serve.command cannot be empty");
+        }
+        if manifest.prepare.iter().any(Vec::is_empty) {
+            bail!("prepare commands cannot be empty");
         }
         Ok(manifest)
     }
@@ -95,4 +111,7 @@ const fn default_startup_timeout() -> u64 {
 }
 const fn default_idle_timeout() -> u64 {
     60
+}
+const fn default_request_timeout() -> u64 {
+    30
 }

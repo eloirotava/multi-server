@@ -45,6 +45,19 @@ Static sites use a smaller manifest:
 
 Exact domain directories take precedence. If no exact directory exists, parent-domain manifests with `"domains": { "subdomains": true }` may handle the request.
 
+Commands that must run once before the first application start can be declared at the top level. A failed command prevents the site from starting:
+
+```json
+"prepare": [
+  ["python3", "-m", "venv", ".venv"],
+  [".venv/bin/pip", "install", "-r", "requirements.txt"]
+]
+```
+
+Short-lived programs can use `"mode": "stdio"`. A process is started for every request, receives CGI-style request metadata in environment variables and the request body on standard input, and writes headers plus the response body to standard output.
+
 ## Current scope
 
-This first version supports static files and HTTP applications with dynamically assigned ports. Network namespaces for applications with hard-coded fixed ports, stdio/CGI processes, HLS-specific activity leases, TLS, and file watching are planned follow-up capabilities.
+This version supports static files, per-request stdio/CGI programs, preparation commands, and HTTP applications with dynamically assigned ports. Long HTTP ingestion requests and repeated HLS segment requests count as activity, so an HTTP media process remains alive until both stop and its idle timeout expires.
+
+Network namespaces for applications with colliding hard-coded ports are not implemented yet. TLS, WebSocket proxying, graceful process-group shutdown, automatic reload after file changes, and precise HLS publisher/viewer probes are also planned follow-up capabilities.
