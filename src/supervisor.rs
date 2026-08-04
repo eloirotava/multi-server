@@ -9,8 +9,9 @@ use std::{
 use anyhow::{Context, bail};
 use axum::{
     body::{Body, to_bytes},
-    http::{HeaderValue, Request, Response, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header},
 };
+use futures_util::StreamExt;
 use tokio::{
     net::TcpListener,
     process::{Child, Command},
@@ -39,6 +40,31 @@ struct ServiceState {
     last_activity: Instant,
     active_requests: usize,
     prepared: bool,
+}
+
+struct RequestActivity {
+    service: Arc<Service>,
+}
+
+impl RequestActivity {
+    async fn begin(service: Arc<Service>) -> Self {
+        let mut state = service.state.lock().await;
+        state.active_requests += 1;
+        state.last_activity = Instant::now();
+        drop(state);
+        Self { service }
+    }
+}
+
+impl Drop for RequestActivity {
+    fn drop(&mut self) {
+        let service = self.service.clone();
+        tokio::spawn(async move {
+            let mut state = service.state.lock().await;
+            state.active_requests = state.active_requests.saturating_sub(1);
+            state.last_activity = Instant::now();
+        });
+    }
 }
 
 enum Phase {
@@ -81,18 +107,8 @@ impl Supervisor {
     ) -> anyhow::Result<Response<Body>> {
         let service = self.service_for(&site.directory).await;
         let port = ensure_running(service.clone(), &site).await?;
-        {
-            let mut state = service.state.lock().await;
-            state.active_requests += 1;
-            state.last_activity = Instant::now();
-        }
-        let result = self.proxy_to_port(port, request).await;
-        {
-            let mut state = service.state.lock().await;
-            state.active_requests = state.active_requests.saturating_sub(1);
-            state.last_activity = Instant::now();
-        }
-        result
+        let activity = RequestActivity::begin(service).await;
+        self.proxy_to_port(port, request, activity).await
     }
 
     async fn stdio(
@@ -127,6 +143,7 @@ impl Supervisor {
         &self,
         port: u16,
         request: Request<Body>,
+        activity: RequestActivity,
     ) -> anyhow::Result<Response<Body>> {
         let (parts, body) = request.into_parts();
         let url = format!(
@@ -136,24 +153,57 @@ impl Supervisor {
                 .path_and_query()
                 .map_or("/", |value| value.as_str())
         );
-        let mut upstream = self
+        let mut request_headers = parts.headers;
+        remove_hop_by_hop_headers(&mut request_headers);
+        let upstream = self
             .client
             .request(parts.method, url)
-            .headers(parts.headers);
-        let body = to_bytes(body, usize::MAX)
-            .await
-            .context("failed to read request body")?;
-        upstream = upstream.body(body);
+            .headers(request_headers)
+            .body(reqwest::Body::wrap_stream(body.into_data_stream()));
         let upstream = upstream.send().await.context("upstream request failed")?;
         let status = upstream.status();
-        let headers = upstream.headers().clone();
-        let bytes = upstream
-            .bytes()
-            .await
-            .context("failed to read upstream response")?;
-        let mut response = Response::builder().status(status).body(Body::from(bytes))?;
+        let mut headers = upstream.headers().clone();
+        remove_hop_by_hop_headers(&mut headers);
+        let mut upstream_body = upstream.bytes_stream();
+        let body = async_stream::stream! {
+            let _activity = activity;
+            while let Some(chunk) = upstream_body.next().await {
+                yield chunk;
+            }
+        };
+        let mut response = Response::builder()
+            .status(status)
+            .body(Body::from_stream(body))?;
         *response.headers_mut() = headers;
         Ok(response)
+    }
+}
+
+fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
+    let connection_headers = headers
+        .get(header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|name| name.trim().parse().ok())
+                .collect::<Vec<HeaderName>>()
+        })
+        .unwrap_or_default();
+    for name in connection_headers {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
     }
 }
 
@@ -505,5 +555,24 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
         );
+    }
+
+    #[test]
+    fn removes_standard_and_connection_named_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONNECTION,
+            "keep-alive, x-internal".parse().unwrap(),
+        );
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("x-internal", "secret".parse().unwrap());
+        headers.insert("x-forwarded-test", "kept".parse().unwrap());
+
+        remove_hop_by_hop_headers(&mut headers);
+
+        assert!(!headers.contains_key(header::CONNECTION));
+        assert!(!headers.contains_key("keep-alive"));
+        assert!(!headers.contains_key("x-internal"));
+        assert_eq!(headers["x-forwarded-test"], "kept");
     }
 }

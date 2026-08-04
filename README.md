@@ -58,6 +58,6 @@ Short-lived programs can use `"mode": "stdio"`. A process is started for every r
 
 ## Current scope
 
-This version supports static files, per-request stdio/CGI programs, preparation commands, and HTTP applications with dynamically assigned ports. Long HTTP ingestion requests and repeated HLS segment requests count as activity, so an HTTP media process remains alive until both stop and its idle timeout expires.
+This version supports static files, per-request stdio/CGI programs, preparation commands, and HTTP applications with dynamically assigned ports. Proxied request and response bodies are streamed rather than buffered in memory. Long HTTP ingestion requests and repeated HLS segment requests count as activity, so an HTTP media process remains alive until both stop and its idle timeout expires.
 
-Network namespaces for applications with colliding hard-coded ports are not implemented yet. TLS, WebSocket proxying, graceful process-group shutdown, automatic reload after file changes, and precise HLS publisher/viewer probes are also planned follow-up capabilities.
+Network namespaces for applications with colliding hard-coded ports are not implemented yet. TLS, WebSocket upgrades, graceful process-group shutdown, automatic reload after file changes, and precise HLS publisher/viewer probes are also planned follow-up capabilities.
