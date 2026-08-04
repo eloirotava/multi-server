@@ -8,6 +8,8 @@
 cargo run -- --root ./sites --listen 127.0.0.1:8080
 ```
 
+The repository includes ready-to-read examples under [`sites/`](sites/README.md): a static site, a per-request shell script, Flask, and FastAPI/Uvicorn.
+
 Create `sites/eloi.rotava.com/site.json`:
 
 ```json

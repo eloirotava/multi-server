@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "serve": {
+    "mode": "stdio",
+    "command": ["sh", "page.sh"],
+    "timeout_seconds": 5
+  }
+}

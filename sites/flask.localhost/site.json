@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "prepare": [
+    ["python3", "-m", "venv", ".venv"],
+    [".venv/bin/pip", "install", "-r", "requirements.txt"]
+  ],
+  "serve": {
+    "mode": "http",
+    "command": [".venv/bin/python", "app.py"],
+    "port_environment": "PORT",
+    "startup_timeout_seconds": 30
+  },
+  "lifecycle": {
+    "idle_timeout_seconds": 30
+  }
+}
