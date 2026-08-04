@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let supervisor = Arc::new(Supervisor::new(args.root, reqwest::Client::new()));
+    let supervisor = Arc::new(Supervisor::new(args.root, reqwest::Client::new())?);
     let app = Router::new().fallback(any(dispatch)).with_state(supervisor);
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

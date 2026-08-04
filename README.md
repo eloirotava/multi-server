@@ -74,8 +74,10 @@ Commands that must run once before the first application start can be declared a
 
 Short-lived programs can use `"mode": "stdio"`. A process is started for every request, receives CGI-style request metadata in environment variables and the request body on standard input, and writes headers plus the response body to standard output.
 
+`site.json` is watched for changes. For a deploy, copy the application files first and replace or touch `site.json` last. The supervisor lets active requests finish, stops the old process, runs `prepare` again, and starts the new version only when another request arrives. Other file changes are deliberately ignored so application data, uploads, caches, and generated media do not restart a site.
+
 ## Current scope
 
 This version supports static files, per-request stdio/CGI programs, preparation commands, and HTTP applications with dynamically assigned ports. Proxied request and response bodies are streamed rather than buffered in memory. Long HTTP ingestion requests and repeated HLS segment requests count as activity, so an HTTP media process remains alive until both stop and its idle timeout expires.
 
-Native network namespace creation is not implemented yet; container commands can already provide equivalent isolation without making the supervisor aware of a language or framework. TLS is intentionally outside the current scope because the service is designed to listen behind a local Cloudflare Tunnel. WebSocket upgrades, graceful process-group shutdown, automatic reload after file changes, and precise activity probes are planned follow-up capabilities.
+Native network namespace creation is not implemented yet; container commands can already provide equivalent isolation without making the supervisor aware of a language or framework. TLS is intentionally outside the current scope because the service is designed to listen behind a local Cloudflare Tunnel. WebSocket upgrades, graceful process-group shutdown, and configurable activity probes remain planned follow-up capabilities.

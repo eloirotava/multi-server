@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -12,6 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header},
 };
 use futures_util::StreamExt;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{
     net::TcpListener,
     process::{Child, Command},
@@ -28,6 +29,7 @@ pub struct Supervisor {
     root: PathBuf,
     client: reqwest::Client,
     services: Arc<Mutex<HashMap<PathBuf, Arc<Service>>>>,
+    _watcher: StdMutex<RecommendedWatcher>,
 }
 
 struct Service {
@@ -40,6 +42,7 @@ struct ServiceState {
     last_activity: Instant,
     active_requests: usize,
     prepared: bool,
+    dirty: bool,
 }
 
 struct RequestActivity {
@@ -63,6 +66,7 @@ impl Drop for RequestActivity {
             let mut state = service.state.lock().await;
             state.active_requests = state.active_requests.saturating_sub(1);
             state.last_activity = Instant::now();
+            service.changed.notify_waiters();
         });
     }
 }
@@ -80,12 +84,46 @@ struct Upstream {
 }
 
 impl Supervisor {
-    pub fn new(root: PathBuf, client: reqwest::Client) -> Self {
-        Self {
+    pub fn new(root: PathBuf, client: reqwest::Client) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create site root {}", root.display()))?;
+        let services = Arc::new(Mutex::new(HashMap::<PathBuf, Arc<Service>>::new()));
+        let (changes, mut changed_paths) = tokio::sync::mpsc::unbounded_channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            if let Ok(event) = event {
+                let _ = changes.send(event);
+            }
+        })
+        .context("failed to create site file watcher")?;
+        watcher
+            .watch(&root, RecursiveMode::Recursive)
+            .with_context(|| format!("failed to watch {}", root.display()))?;
+        let watched_services = services.clone();
+        tokio::spawn(async move {
+            while let Some(event) = changed_paths.recv().await {
+                if !event
+                    .paths
+                    .iter()
+                    .any(|path| path.file_name().is_some_and(|name| name == "site.json"))
+                {
+                    continue;
+                }
+                let services = watched_services.lock().await;
+                for (directory, service) in services.iter() {
+                    if event.paths.iter().any(|path| path.starts_with(directory)) {
+                        let mut state = service.state.lock().await;
+                        state.dirty = true;
+                        service.changed.notify_waiters();
+                    }
+                }
+            }
+        });
+        Ok(Self {
             root,
             client,
-            services: Arc::new(Mutex::new(HashMap::new())),
-        }
+            services,
+            _watcher: StdMutex::new(watcher),
+        })
     }
 
     pub async fn handle(&self, request: Request<Body>) -> anyhow::Result<Response<Body>> {
@@ -123,7 +161,8 @@ impl Supervisor {
         request: Request<Body>,
     ) -> anyhow::Result<Response<Body>> {
         let service = self.service_for(&site.directory).await;
-        ensure_prepared(service, &site).await?;
+        ensure_prepared(service.clone(), &site).await?;
+        let _activity = RequestActivity::begin(service).await;
         run_stdio(&site, request).await
     }
 
@@ -138,6 +177,7 @@ impl Supervisor {
                         last_activity: Instant::now(),
                         active_requests: 0,
                         prepared: false,
+                        dirty: false,
                     }),
                     changed: Notify::new(),
                 })
@@ -220,6 +260,20 @@ async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::R
         let notified = service.changed.notified();
         let mut state = service.state.lock().await;
         state.last_activity = Instant::now();
+        if state.dirty && matches!(state.phase, Phase::Running { .. }) {
+            if state.active_requests > 0 {
+                drop(state);
+                notified.await;
+                continue;
+            }
+            if let Phase::Running { child, .. } = &mut state.phase {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            state.phase = Phase::Stopped;
+            state.prepared = false;
+            continue;
+        }
         match &mut state.phase {
             Phase::Running { upstream, child } => {
                 if child.try_wait()?.is_none() {
@@ -247,6 +301,7 @@ async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::R
                 match started {
                     Ok((upstream, child)) => {
                         state.prepared = true;
+                        state.dirty = false;
                         state.phase = Phase::Running {
                             upstream: upstream.clone(),
                             child,
@@ -271,8 +326,16 @@ async fn ensure_prepared(service: Arc<Service>, site: &ResolvedSite) -> anyhow::
     loop {
         let notified = service.changed.notified();
         let mut state = service.state.lock().await;
+        if state.dirty {
+            state.prepared = false;
+        }
         if state.prepared {
             return Ok(());
+        }
+        if state.active_requests > 0 {
+            drop(state);
+            notified.await;
+            continue;
         }
         match &state.phase {
             Phase::Starting => {
@@ -287,6 +350,7 @@ async fn ensure_prepared(service: Arc<Service>, site: &ResolvedSite) -> anyhow::
                 state.phase = Phase::Stopped;
                 if prepared.is_ok() {
                     state.prepared = true;
+                    state.dirty = false;
                 }
                 service.changed.notify_waiters();
                 return prepared;
