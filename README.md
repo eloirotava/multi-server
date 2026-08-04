@@ -133,10 +133,57 @@ Commands that must run once before the first application start can be declared a
 
 Short-lived programs can use `"mode": "stdio"`. A process is started for every request, receives CGI-style request metadata in environment variables and the request body on standard input, and writes headers plus the response body to standard output.
 
+The generic HTTP mode also supports optional readiness, resource, activity, shutdown, and network policies:
+
+```json
+{
+  "version": 1,
+  "serve": {
+    "mode": "http",
+    "command": ["./server", "--port", "${PORT}"],
+    "readiness": {
+      "mode": "http",
+      "path": "/health",
+      "status": 200
+    },
+    "network": {
+      "mode": "host"
+    }
+  },
+  "lifecycle": {
+    "idle_timeout_seconds": 60,
+    "shutdown_grace_seconds": 10,
+    "activity_paths": ["/api/", "/hls/"]
+  },
+  "limits": {
+    "request_body_bytes": 67108864,
+    "stdio_output_bytes": 16777216,
+    "max_concurrent_requests": 64
+  }
+}
+```
+
+`activity_paths` controls which completed requests renew the idle deadline; every in-flight HTTP request or WebSocket still prevents shutdown. Readiness defaults to a TCP connection check. An HTTP readiness probe delays the first proxied request until the configured endpoint returns the expected status.
+
+For two trusted applications that both require the same fixed port, Linux can place each one in its own native network namespace:
+
+```json
+{
+  "serve": {
+    "mode": "http",
+    "command": ["./server"],
+    "port": 8080,
+    "network": { "mode": "namespace" }
+  }
+}
+```
+
+Namespace mode requires root or `CAP_NET_ADMIN`, the `ip` command from `iproute2`, and an application listening on `0.0.0.0` rather than only namespace-local `127.0.0.1`. The namespace and veth pair are created on demand and removed when the process stops.
+
 `site.json` is watched for changes. For a deploy, copy the application files first and replace or touch `site.json` last. The supervisor lets active requests finish, stops the old process, runs `prepare` again, and starts the new version only when another request arrives. Other file changes are deliberately ignored so application data, uploads, caches, and generated media do not restart a site.
 
 ## Current scope
 
-This version supports static files, per-request stdio/CGI programs, preparation commands, and HTTP applications with dynamically assigned ports. Proxied request and response bodies are streamed rather than buffered in memory. Long HTTP ingestion requests and repeated HLS segment requests count as activity, so an HTTP media process remains alive until both stop and its idle timeout expires.
+This version supports static files with streaming, conditional requests, and single byte ranges; per-request stdio/CGI programs; preparation commands; HTTP applications with dynamic or fixed ports; WebSocket upgrades; graceful process-group shutdown; health checks; request/concurrency limits; configurable activity; and optional native network namespaces. Proxied bodies are streamed rather than buffered in memory.
 
-Native network namespace creation is not implemented yet; container commands can already provide equivalent isolation without making the supervisor aware of a language or framework. TLS is intentionally outside the current scope because the service is designed to listen behind a local Cloudflare Tunnel. WebSocket upgrades, graceful process-group shutdown, and configurable activity probes remain planned follow-up capabilities.
+TLS remains intentionally outside the scope because the service is designed to listen behind a local Cloudflare Tunnel. Multiple byte ranges are rejected rather than encoded as multipart responses, and non-HTTP protocols such as RTMP, SRT, and raw TCP require a separate protocol-specific ingress process.

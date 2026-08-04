@@ -12,16 +12,19 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header},
 };
 use futures_util::StreamExt;
+use hyper_util::rt::TokioIo;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
     net::TcpListener,
     process::{Child, Command},
     sync::{Mutex, Notify},
 };
+use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::{
-    manifest::Serve,
+    manifest::{Network, Readiness, Serve},
     resolver::{ResolvedSite, resolve},
 };
 
@@ -47,25 +50,37 @@ struct ServiceState {
 
 struct RequestActivity {
     service: Arc<Service>,
+    renew_idle: bool,
 }
 
 impl RequestActivity {
-    async fn begin(service: Arc<Service>) -> Self {
+    async fn begin(service: Arc<Service>, maximum: usize, renew_idle: bool) -> Option<Self> {
         let mut state = service.state.lock().await;
+        if state.active_requests >= maximum {
+            return None;
+        }
         state.active_requests += 1;
-        state.last_activity = Instant::now();
+        if renew_idle {
+            state.last_activity = Instant::now();
+        }
         drop(state);
-        Self { service }
+        Some(Self {
+            service,
+            renew_idle,
+        })
     }
 }
 
 impl Drop for RequestActivity {
     fn drop(&mut self) {
         let service = self.service.clone();
+        let renew_idle = self.renew_idle;
         tokio::spawn(async move {
             let mut state = service.state.lock().await;
             state.active_requests = state.active_requests.saturating_sub(1);
-            state.last_activity = Instant::now();
+            if renew_idle {
+                state.last_activity = Instant::now();
+            }
             service.changed.notify_waiters();
         });
     }
@@ -74,7 +89,11 @@ impl Drop for RequestActivity {
 enum Phase {
     Stopped,
     Starting,
-    Running { upstream: Upstream, child: Child },
+    Running {
+        upstream: Upstream,
+        child: Child,
+        namespace: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -137,7 +156,7 @@ impl Supervisor {
         };
         match &site.manifest.serve {
             Serve::Static { root, index } => {
-                serve_static(&site.directory, root, index, request.uri().path()).await
+                serve_static(&site.directory, root, index, request).await
             }
             Serve::Http { .. } => self.proxy(site, request).await,
             Serve::Stdio { .. } => self.stdio(site, request).await,
@@ -151,8 +170,73 @@ impl Supervisor {
     ) -> anyhow::Result<Response<Body>> {
         let service = self.service_for(&site.directory).await;
         let upstream = ensure_running(service.clone(), &site).await?;
-        let activity = RequestActivity::begin(service).await;
-        self.proxy_to_upstream(&upstream, request, activity).await
+        if request_body_too_large(&request, site.manifest.limits.request_body_bytes) {
+            return Ok(response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large\n",
+            ));
+        }
+        let renew_idle = path_is_activity(&site, request.uri().path());
+        let Some(activity) = RequestActivity::begin(
+            service,
+            site.manifest.limits.max_concurrent_requests,
+            renew_idle,
+        )
+        .await
+        else {
+            return Ok(response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "site concurrency limit reached\n",
+            ));
+        };
+        if is_upgrade_request(&request) {
+            return self.proxy_websocket(&upstream, request, activity).await;
+        }
+        self.proxy_to_upstream(
+            &upstream,
+            request,
+            activity,
+            site.manifest.limits.request_body_bytes,
+        )
+        .await
+    }
+
+    async fn proxy_websocket(
+        &self,
+        upstream: &Upstream,
+        mut request: Request<Body>,
+        activity: RequestActivity,
+    ) -> anyhow::Result<Response<Body>> {
+        let client_upgrade = hyper::upgrade::on(&mut request);
+        let stream = tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port))
+            .await
+            .context("failed to connect WebSocket upstream")?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.with_upgrades().await {
+                warn!(%error, "WebSocket upstream connection failed");
+            }
+        });
+        let mut upstream_response = sender.send_request(request).await?;
+        let upstream_upgrade = hyper::upgrade::on(&mut upstream_response);
+        tokio::spawn(async move {
+            let _activity = activity;
+            let (client, upstream) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
+                Ok(upgrades) => upgrades,
+                Err(error) => {
+                    warn!(%error, "WebSocket upgrade failed");
+                    return;
+                }
+            };
+            let mut client = TokioIo::new(client);
+            let mut upstream = TokioIo::new(upstream);
+            if let Err(error) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                warn!(%error, "WebSocket tunnel failed");
+            }
+        });
+        let (parts, body) = upstream_response.into_parts();
+        Ok(Response::from_parts(parts, Body::new(body)))
     }
 
     async fn stdio(
@@ -162,7 +246,25 @@ impl Supervisor {
     ) -> anyhow::Result<Response<Body>> {
         let service = self.service_for(&site.directory).await;
         ensure_prepared(service.clone(), &site).await?;
-        let _activity = RequestActivity::begin(service).await;
+        if request_body_too_large(&request, site.manifest.limits.request_body_bytes) {
+            return Ok(response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large\n",
+            ));
+        }
+        let renew_idle = path_is_activity(&site, request.uri().path());
+        let Some(_activity) = RequestActivity::begin(
+            service,
+            site.manifest.limits.max_concurrent_requests,
+            renew_idle,
+        )
+        .await
+        else {
+            return Ok(response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "site concurrency limit reached\n",
+            ));
+        };
         run_stdio(&site, request).await
     }
 
@@ -190,6 +292,7 @@ impl Supervisor {
         upstream: &Upstream,
         request: Request<Body>,
         activity: RequestActivity,
+        body_limit: usize,
     ) -> anyhow::Result<Response<Body>> {
         let (parts, body) = request.into_parts();
         let url = format!(
@@ -203,11 +306,33 @@ impl Supervisor {
         );
         let mut request_headers = parts.headers;
         remove_hop_by_hop_headers(&mut request_headers);
+        let mut received = 0usize;
+        let mut incoming = body.into_data_stream();
+        let limited_body = async_stream::stream! {
+            while let Some(chunk) = incoming.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        yield Err::<axum::body::Bytes, _>(std::io::Error::other(error.to_string()));
+                        break;
+                    }
+                };
+                received = received.saturating_add(chunk.len());
+                if received > body_limit {
+                    yield Err::<axum::body::Bytes, _>(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "request body limit exceeded",
+                    ));
+                    break;
+                }
+                yield Ok(chunk);
+            }
+        };
         let upstream = self
             .client
             .request(parts.method, url)
             .headers(request_headers)
-            .body(reqwest::Body::wrap_stream(body.into_data_stream()));
+            .body(reqwest::Body::wrap_stream(limited_body));
         let upstream = upstream.send().await.context("upstream request failed")?;
         let status = upstream.status();
         let mut headers = upstream.headers().clone();
@@ -255,6 +380,36 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
+fn is_upgrade_request(request: &Request<Body>) -> bool {
+    request.headers().contains_key(header::UPGRADE)
+        && request
+            .headers()
+            .get(header::CONNECTION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+}
+
+fn path_is_activity(site: &ResolvedSite, path: &str) -> bool {
+    site.manifest
+        .lifecycle
+        .activity_paths
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+fn request_body_too_large(request: &Request<Body>, limit: usize) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > limit as u64)
+}
+
 async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::Result<Upstream> {
     loop {
         let notified = service.changed.notified();
@@ -266,20 +421,29 @@ async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::R
                 notified.await;
                 continue;
             }
-            if let Phase::Running { child, .. } = &mut state.phase {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+            if let Phase::Running {
+                child, namespace, ..
+            } = &mut state.phase
+            {
+                terminate_process_group(child, site.manifest.lifecycle.shutdown_grace_seconds)
+                    .await;
+                cleanup_namespace(namespace.take()).await;
             }
             state.phase = Phase::Stopped;
             state.prepared = false;
             continue;
         }
         match &mut state.phase {
-            Phase::Running { upstream, child } => {
+            Phase::Running {
+                upstream,
+                child,
+                namespace,
+            } => {
                 if child.try_wait()?.is_none() {
                     return Ok(upstream.clone());
                 }
                 warn!(domain = %site.domain, "site process exited; restarting");
+                cleanup_namespace(namespace.take()).await;
                 state.phase = Phase::Stopped;
             }
             Phase::Starting => {
@@ -299,12 +463,13 @@ async fn ensure_running(service: Arc<Service>, site: &ResolvedSite) -> anyhow::R
                 .await;
                 let mut state = service.state.lock().await;
                 match started {
-                    Ok((upstream, child)) => {
+                    Ok((upstream, child, namespace)) => {
                         state.prepared = true;
                         state.dirty = false;
                         state.phase = Phase::Running {
                             upstream: upstream.clone(),
                             child,
+                            namespace,
                         };
                         state.last_activity = Instant::now();
                         service.changed.notify_waiters();
@@ -390,7 +555,7 @@ async fn run_stdio(site: &ResolvedSite, request: Request<Body>) -> anyhow::Resul
         bail!("not a stdio service");
     };
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, site.manifest.limits.request_body_bytes)
         .await
         .context("failed to read request body")?;
     let mut process = Command::new(&command[0]);
@@ -411,6 +576,7 @@ async fn run_stdio(site: &ResolvedSite, request: Request<Body>) -> anyhow::Resul
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    configure_process_group(&mut process);
     for (name, value) in &parts.headers {
         if let Ok(value) = value.to_str() {
             let name = format!(
@@ -430,16 +596,34 @@ async fn run_stdio(site: &ResolvedSite, request: Request<Body>) -> anyhow::Resul
             .await
             .context("failed to write request body to site")?;
     }
-    let output = tokio::time::timeout(
-        Duration::from_secs(*timeout_seconds),
-        child.wait_with_output(),
-    )
-    .await
-    .context("stdio site timed out")??;
-    if !output.status.success() {
-        bail!("stdio site exited with {}", output.status);
+    let stdout = child.stdout.take().context("stdio site has no stdout")?;
+    let output_limit = site.manifest.limits.stdio_output_bytes;
+    let output_reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stdout
+            .take(output_limit.saturating_add(1) as u64)
+            .read_to_end(&mut output)
+            .await?;
+        Ok::<_, std::io::Error>(output)
+    });
+    let status =
+        match tokio::time::timeout(Duration::from_secs(*timeout_seconds), child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                terminate_process_group(&mut child, 1).await;
+                bail!("stdio site timed out");
+            }
+        };
+    let output = output_reader
+        .await
+        .context("stdio output reader failed")??;
+    if !status.success() {
+        bail!("stdio site exited with {status}");
     }
-    parse_cgi_response(&output.stdout)
+    if output.len() > output_limit {
+        bail!("stdio site exceeded its output limit");
+    }
+    parse_cgi_response(&output)
 }
 
 fn parse_cgi_response(output: &[u8]) -> anyhow::Result<Response<Body>> {
@@ -480,7 +664,7 @@ fn parse_cgi_response(output: &[u8]) -> anyhow::Result<Response<Body>> {
     Ok(builder.body(Body::from(output[header_end + separator_len..].to_vec()))?)
 }
 
-async fn start_process(site: &ResolvedSite) -> anyhow::Result<(Upstream, Child)> {
+async fn start_process(site: &ResolvedSite) -> anyhow::Result<(Upstream, Child, Option<String>)> {
     let Serve::Http {
         command,
         environment,
@@ -489,6 +673,8 @@ async fn start_process(site: &ResolvedSite) -> anyhow::Result<(Upstream, Child)>
         port,
         upstream_host,
         startup_timeout_seconds,
+        readiness,
+        network,
     } = &site.manifest.serve
     else {
         bail!("not an HTTP service");
@@ -511,7 +697,17 @@ async fn start_process(site: &ResolvedSite) -> anyhow::Result<(Upstream, Child)>
         .iter()
         .map(|value| expand_runtime_variables(value, &variables))
         .collect::<Vec<_>>();
-    let mut process = Command::new(&expanded_command[0]);
+    let namespace = match network {
+        Network::Host => None,
+        Network::Namespace => Some(create_namespace(&site.directory).await?),
+    };
+    let mut process = if let Some(namespace) = &namespace {
+        let mut process = Command::new("ip");
+        process.args(["netns", "exec", namespace, &expanded_command[0]]);
+        process
+    } else {
+        Command::new(&expanded_command[0])
+    };
     process
         .args(&expanded_command[1..])
         .current_dir(
@@ -529,34 +725,152 @@ async fn start_process(site: &ResolvedSite) -> anyhow::Result<(Upstream, Child)>
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
-    let child = process
-        .spawn()
-        .with_context(|| format!("failed to start {}", command[0]))?;
+    configure_process_group(&mut process);
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup_namespace(namespace.clone()).await;
+            return Err(error).with_context(|| format!("failed to start {}", command[0]));
+        }
+    };
     let upstream = Upstream {
-        host: expand_runtime_variables(upstream_host, &variables),
+        host: if let Some(namespace) = &namespace {
+            namespace_address(namespace)
+        } else {
+            expand_runtime_variables(upstream_host, &variables)
+        },
         port: selected_port,
     };
     let timeout = Duration::from_secs(*startup_timeout_seconds);
-    tokio::time::timeout(timeout, async {
+    let readiness_client = reqwest::Client::new();
+    let ready = tokio::time::timeout(timeout, async {
         loop {
-            if tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port))
-                .await
-                .is_ok()
-            {
+            if readiness_ready(&readiness_client, &upstream, readiness).await {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .with_context(|| {
-        format!(
-            "site did not listen on {}:{} within {timeout:?}",
-            upstream.host, upstream.port
-        )
-    })?;
+    .await;
+    if ready.is_err() {
+        terminate_process_group(&mut child, site.manifest.lifecycle.shutdown_grace_seconds).await;
+        cleanup_namespace(namespace.clone()).await;
+        bail!(
+            "site did not become ready on {}:{} within {timeout:?}",
+            upstream.host,
+            upstream.port
+        );
+    }
     info!(domain = %site.domain, host = %upstream.host, port = upstream.port, "site process started");
-    Ok((upstream, child))
+    Ok((upstream, child, namespace))
+}
+
+async fn readiness_ready(
+    client: &reqwest::Client,
+    upstream: &Upstream,
+    readiness: &Readiness,
+) -> bool {
+    match readiness {
+        Readiness::Tcp => tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port))
+            .await
+            .is_ok(),
+        Readiness::Http { path, status } => {
+            let url = format!("http://{}:{}{}", upstream.host, upstream.port, path);
+            client
+                .get(url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().as_u16() == *status)
+        }
+    }
+}
+
+async fn create_namespace(site_directory: &Path) -> anyhow::Result<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    site_directory.hash(&mut hasher);
+    let id = hasher.finish() as u32;
+    let namespace = format!("ms{id:08x}");
+    let host_interface = format!("mh{id:08x}");
+    let namespace_interface = format!("mn{id:08x}");
+    let (host_address, guest_address) = namespace_addresses(id);
+    cleanup_namespace(Some(namespace.clone())).await;
+    let commands = [
+        vec!["netns", "add", &namespace],
+        vec![
+            "link",
+            "add",
+            &host_interface,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            &namespace_interface,
+        ],
+        vec!["link", "set", &namespace_interface, "netns", &namespace],
+        vec!["addr", "add", &host_address, "dev", &host_interface],
+        vec!["link", "set", &host_interface, "up"],
+        vec!["netns", "exec", &namespace, "ip", "link", "set", "lo", "up"],
+        vec![
+            "netns",
+            "exec",
+            &namespace,
+            "ip",
+            "addr",
+            "add",
+            &guest_address,
+            "dev",
+            &namespace_interface,
+        ],
+        vec![
+            "netns",
+            "exec",
+            &namespace,
+            "ip",
+            "link",
+            "set",
+            &namespace_interface,
+            "up",
+        ],
+    ];
+    for args in commands {
+        let status = Command::new("ip").args(args).status().await?;
+        if !status.success() {
+            cleanup_namespace(Some(namespace.clone())).await;
+            bail!("failed to configure network namespace {namespace}");
+        }
+    }
+    Ok(namespace)
+}
+
+fn namespace_addresses(id: u32) -> (String, String) {
+    let third = ((id >> 8) & 0xff) as u8;
+    let base = ((id & 0x3f) * 4) as u8;
+    (
+        format!("10.203.{third}.{}/30", base + 1),
+        format!("10.203.{third}.{}/30", base + 2),
+    )
+}
+
+fn namespace_address(namespace: &str) -> String {
+    let id = u32::from_str_radix(namespace.trim_start_matches("ms"), 16).unwrap_or_default();
+    namespace_addresses(id)
+        .1
+        .split('/')
+        .next()
+        .unwrap_or("127.0.0.1")
+        .to_owned()
+}
+
+async fn cleanup_namespace(namespace: Option<String>) {
+    if let Some(namespace) = namespace {
+        let _ = Command::new("ip")
+            .args(["netns", "del", &namespace])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
 }
 
 struct RuntimeVariables<'a> {
@@ -584,10 +898,14 @@ fn spawn_idle_reaper(service: Arc<Service>, site: ResolvedSite) {
             if state.active_requests > 0 || state.last_activity.elapsed() < idle {
                 continue;
             }
-            if let Phase::Running { child, .. } = &mut state.phase {
+            if let Phase::Running {
+                child, namespace, ..
+            } = &mut state.phase
+            {
                 info!(domain = %site.domain, "stopping idle site process");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                terminate_process_group(child, site.manifest.lifecycle.shutdown_grace_seconds)
+                    .await;
+                cleanup_namespace(namespace.take()).await;
             }
             state.phase = Phase::Stopped;
             service.changed.notify_waiters();
@@ -596,12 +914,48 @@ fn spawn_idle_reaper(service: Arc<Service>, site: ResolvedSite) {
     });
 }
 
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+async fn terminate_process_group(child: &mut Child, grace_seconds: u64) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        if tokio::time::timeout(Duration::from_secs(grace_seconds), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        let _ = child.wait().await;
+        return;
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 async fn serve_static(
     site_dir: &Path,
     root: &str,
     indexes: &[String],
-    uri_path: &str,
+    request: Request<Body>,
 ) -> anyhow::Result<Response<Body>> {
+    let uri_path = request.uri().path();
     let relative = uri_path.trim_start_matches('/');
     let relative = Path::new(relative);
     if relative
@@ -626,21 +980,122 @@ async fn serve_static(
             path = index;
         }
     }
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(response(StatusCode::NOT_FOUND, "not found\n"));
         }
+        Ok(_) => return Ok(response(StatusCode::NOT_FOUND, "not found\n")),
         Err(error) => return Err(error.into()),
     };
+    let modified = metadata.modified().ok();
+    let etag = format!(
+        "\"{:x}-{:x}\"",
+        metadata.len(),
+        modified
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos())
+    );
+    if request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|candidate| candidate.trim() == etag.as_str())
+        })
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .body(Body::empty())?);
+    }
+    if let (Some(modified), Some(since)) = (
+        modified,
+        request
+            .headers()
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| httpdate::parse_http_date(value).ok()),
+    ) {
+        if modified <= since + Duration::from_secs(1) {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, etag)
+                .body(Body::empty())?);
+        }
+    }
+    let (start, end, status) = match request
+        .headers()
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) => match parse_byte_range(value, metadata.len()) {
+            Some((start, end)) => (start, end, StatusCode::PARTIAL_CONTENT),
+            None => {
+                return Ok(Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", metadata.len()))
+                    .body(Body::empty())?);
+            }
+        },
+        None => (0, metadata.len().saturating_sub(1), StatusCode::OK),
+    };
+    let length = if metadata.len() == 0 {
+        0
+    } else {
+        end - start + 1
+    };
+    let mut file = tokio::fs::File::open(&path).await?;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let stream = ReaderStream::new(file.take(length));
     let content_type = mime_guess::from_path(&path)
         .first_or_octet_stream()
         .to_string();
-    let mut response = Response::new(Body::from(bytes));
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_str(&content_type)?);
-    Ok(response)
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, HeaderValue::from_str(&content_type)?)
+        .header(header::CONTENT_LENGTH, length)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, etag);
+    if let Some(modified) = modified {
+        builder = builder.header(header::LAST_MODIFIED, httpdate::fmt_http_date(modified));
+    }
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", metadata.len()),
+        );
+    }
+    let body = if request.method() == axum::http::Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from_stream(stream)
+    };
+    Ok(builder.body(body)?)
+}
+
+fn parse_byte_range(value: &str, length: u64) -> Option<(u64, u64)> {
+    let range = value.strip_prefix("bytes=")?;
+    if range.contains(',') || length == 0 {
+        return None;
+    }
+    let (start, end) = range.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?.min(length);
+        return (suffix > 0).then_some((length - suffix, length - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    if start >= length {
+        return None;
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        end.parse::<u64>().ok()?.min(length - 1)
+    };
+    (start <= end).then_some((start, end))
 }
 
 fn response(status: StatusCode, body: &'static str) -> Response<Body> {
@@ -709,5 +1164,14 @@ mod tests {
             ),
             "/raiz/example.com/server --domain=example.com --port=32123"
         );
+    }
+
+    #[test]
+    fn parses_single_byte_ranges() {
+        assert_eq!(parse_byte_range("bytes=0-9", 100), Some((0, 9)));
+        assert_eq!(parse_byte_range("bytes=90-", 100), Some((90, 99)));
+        assert_eq!(parse_byte_range("bytes=-10", 100), Some((90, 99)));
+        assert_eq!(parse_byte_range("bytes=100-", 100), None);
+        assert_eq!(parse_byte_range("bytes=0-1,3-4", 100), None);
     }
 }
