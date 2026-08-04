@@ -12,45 +12,55 @@ The repository includes ready-to-read examples under [`sites/`](sites/README.md)
 
 ## Optimized Alpine amd64 build
 
-The release profile enables full LTO, a single code-generation unit, abort-on-panic, optimization level 3, and symbol stripping. It favors a small, fast deployment binary over build speed.
+The release profile enables full LTO, a single code-generation unit, abort-on-panic, optimization level 3, and symbol stripping. The repository also fixes the build target to `x86_64-unknown-linux-musl` with the static C runtime enabled. The resulting `multi-server` executable does not depend on the destination machine's musl, glibc, or other shared libraries.
 
-On an amd64 Alpine machine, such as the environment used by PicoIDE, install the native build tools and compile with:
+On an amd64 Alpine machine, such as the environment used by PicoIDE, use a Rustup toolchain, install the native build tools, and compile with:
 
 ```sh
-apk add --no-cache build-base cargo rust
-cargo build --release
+apk add --no-cache build-base
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 The deployable executable is:
 
 ```text
-target/release/multi-server
+target/x86_64-unknown-linux-musl/release/multi-server
 ```
 
 Confirm its architecture, size, and linkage before copying it:
 
 ```sh
-file target/release/multi-server
-du -h target/release/multi-server
-ldd target/release/multi-server || true
+BIN=target/x86_64-unknown-linux-musl/release/multi-server
+file "$BIN"
+du -h "$BIN"
+ldd "$BIN" 2>&1 || true
+if readelf -l "$BIN" | grep -q 'INTERP'; then
+  echo 'ERRO: o executável possui um interpretador dinâmico' >&2
+  exit 1
+fi
 ```
 
 The default profile prioritizes runtime performance. If binary size matters more, override the optimization level for that build:
 
 ```sh
-CARGO_PROFILE_RELEASE_OPT_LEVEL=z cargo build --release
+CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
+  cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 Do not set `-C target-cpu=native` when the binary may be moved to another amd64 machine: it can emit instructions unavailable on the destination CPU. If compilation and execution always happen on the same machine, an optional machine-specific build is:
 
 ```sh
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=native" \
+  cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 To install the optimized executable and keep the `sites` directory in a persistent location:
 
 ```sh
-install -Dm755 target/release/multi-server /usr/local/bin/multi-server
+install -Dm755 \
+  target/x86_64-unknown-linux-musl/release/multi-server \
+  /usr/local/bin/multi-server
 install -d /var/lib/multi-server/sites
 multi-server --root /var/lib/multi-server/sites --listen 127.0.0.1:8080
 ```
