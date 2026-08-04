@@ -180,10 +180,12 @@ For two trusted applications that both require the same fixed port, Linux can pl
 
 Namespace mode requires root or `CAP_NET_ADMIN`, the `ip` command from `iproute2`, and an application listening on `0.0.0.0` rather than only namespace-local `127.0.0.1`. The namespace and veth pair are created on demand and removed when the process stops.
 
+Ordered `routes` can override the fallback `serve` handler by path prefix or extension. The generic `fastcgi` mode executes an existing PHP script when the URI names one and otherwise sends the request to its configured front controller. Together these features support PHP applications and WordPress-style permalinks without embedding WordPress-specific logic in the supervisor. A complete WordPress-shaped example is available under [`sites/wordpress.localhost`](sites/wordpress.localhost/README.md).
+
 `site.json` is watched for changes. For a deploy, copy the application files first and replace or touch `site.json` last. The supervisor lets active requests finish, stops the old process, runs `prepare` again, and starts the new version only when another request arrives. Other file changes are deliberately ignored so application data, uploads, caches, and generated media do not restart a site.
 
 ## Current scope
 
-This version supports static files with streaming, conditional requests, and single byte ranges; per-request stdio/CGI programs; preparation commands; HTTP applications with dynamic or fixed ports; WebSocket upgrades; graceful process-group shutdown; health checks; request/concurrency limits; configurable activity; and optional native network namespaces. Proxied bodies are streamed rather than buffered in memory.
+This version supports static files with streaming, conditional requests, and single byte ranges; per-request stdio/CGI programs; ordered route composition; FastCGI/front-controller applications; preparation commands; HTTP applications with dynamic or fixed ports; WebSocket upgrades; graceful process-group shutdown; health checks; request/concurrency limits; configurable activity; and optional native network namespaces. Proxied bodies are streamed rather than buffered in memory.
 
 TLS remains intentionally outside the scope because the service is designed to listen behind a local Cloudflare Tunnel. Multiple byte ranges are rejected rather than encoded as multipart responses, and non-HTTP protocols such as RTMP, SRT, and raw TCP require a separate protocol-specific ingress process.

@@ -32,6 +32,7 @@ These folders are examples of the generic manifest contract. Flask and FastAPI r
 | `health.localhost` | Delayed HTTP readiness returning `204` |
 | `activity.localhost` | Only `/hls/` and `/publish/` renew the idle timeout |
 | `rust.localhost` | Building and executing a dependency-free Rust HTTP binary |
+| `wordpress.localhost` | Ordered static routes plus FastCGI/front-controller and wildcard subdomains |
 
 Test a static byte range and conditional cache response:
 
@@ -64,3 +65,14 @@ curl -H 'Host: namespace-b.localhost' http://127.0.0.1:8080/
 ```
 
 Both responses report internal port `8080`, but each process runs in an independent namespace. Namespace examples do not configure outbound NAT; they only demonstrate isolated inbound HTTP routing.
+
+The WordPress-shaped example initially contains a diagnostic `index.php`, not a bundled WordPress distribution:
+
+```sh
+apk add --no-cache php-cgi
+curl -H 'Host: wordpress.localhost' http://127.0.0.1:8080/example/permalink
+curl -H 'Host: blog.wordpress.localhost' http://127.0.0.1:8080/
+curl -H 'Host: wordpress.localhost' http://127.0.0.1:8080/assets/example.css
+```
+
+See [`wordpress.localhost/README.md`](wordpress.localhost/README.md) for replacing the diagnostic files with a real WordPress Multisite tree.

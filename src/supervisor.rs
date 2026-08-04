@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use hyper_util::rt::TokioIo;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::TcpListener,
     process::{Child, Command},
     sync::{Mutex, Notify},
@@ -102,6 +102,9 @@ struct Upstream {
     port: u16,
 }
 
+const TCP_READINESS: Readiness = Readiness::Tcp;
+const HOST_NETWORK: Network = Network::Host;
+
 impl Supervisor {
     pub fn new(root: PathBuf, client: reqwest::Client) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&root)
@@ -129,7 +132,12 @@ impl Supervisor {
                 }
                 let services = watched_services.lock().await;
                 for (directory, service) in services.iter() {
-                    if event.paths.iter().any(|path| path.starts_with(directory)) {
+                    if event.paths.iter().any(|path| {
+                        path.starts_with(directory)
+                            || path
+                                .parent()
+                                .is_some_and(|parent| directory.starts_with(parent))
+                    }) {
                         let mut state = service.state.lock().await;
                         state.dirty = true;
                         service.changed.notify_waiters();
@@ -151,15 +159,26 @@ impl Supervisor {
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        let Some(site) = resolve(&self.root, host).await? else {
+        let Some(mut site) = resolve(&self.root, host).await? else {
             return Ok(response(StatusCode::NOT_FOUND, "unknown domain\n"));
         };
+        if let Some((index, route)) = site
+            .manifest
+            .routes
+            .iter()
+            .enumerate()
+            .find(|(_, route)| route.matches(request.uri().path()))
+        {
+            site.runtime_key = site.directory.join(format!(".multi-server-route-{index}"));
+            site.manifest.serve = route.serve.clone();
+        }
         match &site.manifest.serve {
             Serve::Static { root, index } => {
                 serve_static(&site.directory, root, index, request).await
             }
             Serve::Http { .. } => self.proxy(site, request).await,
             Serve::Stdio { .. } => self.stdio(site, request).await,
+            Serve::Fastcgi { .. } => self.fastcgi(site, request).await,
         }
     }
 
@@ -168,7 +187,7 @@ impl Supervisor {
         site: ResolvedSite,
         request: Request<Body>,
     ) -> anyhow::Result<Response<Body>> {
-        let service = self.service_for(&site.directory).await;
+        let service = self.service_for(&site.runtime_key).await;
         let upstream = ensure_running(service.clone(), &site).await?;
         if request_body_too_large(&request, site.manifest.limits.request_body_bytes) {
             return Ok(response(
@@ -244,7 +263,7 @@ impl Supervisor {
         site: ResolvedSite,
         request: Request<Body>,
     ) -> anyhow::Result<Response<Body>> {
-        let service = self.service_for(&site.directory).await;
+        let service = self.service_for(&site.runtime_key).await;
         ensure_prepared(service.clone(), &site).await?;
         if request_body_too_large(&request, site.manifest.limits.request_body_bytes) {
             return Ok(response(
@@ -266,6 +285,35 @@ impl Supervisor {
             ));
         };
         run_stdio(&site, request).await
+    }
+
+    async fn fastcgi(
+        &self,
+        site: ResolvedSite,
+        request: Request<Body>,
+    ) -> anyhow::Result<Response<Body>> {
+        let service = self.service_for(&site.runtime_key).await;
+        let upstream = ensure_running(service.clone(), &site).await?;
+        if request_body_too_large(&request, site.manifest.limits.request_body_bytes) {
+            return Ok(response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large\n",
+            ));
+        }
+        let renew_idle = path_is_activity(&site, request.uri().path());
+        let Some(_activity) = RequestActivity::begin(
+            service,
+            site.manifest.limits.max_concurrent_requests,
+            renew_idle,
+        )
+        .await
+        else {
+            return Ok(response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "site concurrency limit reached\n",
+            ));
+        };
+        forward_fastcgi(&site, &upstream, request).await
     }
 
     async fn service_for(&self, directory: &Path) -> Arc<Service> {
@@ -590,7 +638,6 @@ async fn run_stdio(site: &ResolvedSite, request: Request<Body>) -> anyhow::Resul
         .spawn()
         .with_context(|| format!("failed to start {}", command[0]))?;
     if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
         stdin
             .write_all(&body)
             .await
@@ -624,6 +671,183 @@ async fn run_stdio(site: &ResolvedSite, request: Request<Body>) -> anyhow::Resul
         bail!("stdio site exceeded its output limit");
     }
     parse_cgi_response(&output)
+}
+
+async fn forward_fastcgi(
+    site: &ResolvedSite,
+    upstream: &Upstream,
+    request: Request<Body>,
+) -> anyhow::Result<Response<Body>> {
+    let Serve::Fastcgi {
+        document_root,
+        front_controller,
+        ..
+    } = &site.manifest.serve
+    else {
+        bail!("not a FastCGI service");
+    };
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, site.manifest.limits.request_body_bytes)
+        .await
+        .context("failed to read FastCGI request body")?;
+    let root = site.directory.join(document_root);
+    let requested = parts.uri.path().trim_start_matches('/');
+    let requested_path = Path::new(requested);
+    let safe_requested = !requested_path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)));
+    let requested_script = root.join(requested_path);
+    let direct_script = safe_requested
+        && requested.ends_with(".php")
+        && tokio::fs::metadata(&requested_script)
+            .await
+            .is_ok_and(|metadata| metadata.is_file());
+    let (script_filename, script_name) = if direct_script {
+        (requested_script, format!("/{requested}"))
+    } else {
+        (root.join(front_controller), format!("/{front_controller}"))
+    };
+    if !tokio::fs::try_exists(&script_filename).await? {
+        return Ok(response(
+            StatusCode::NOT_FOUND,
+            "FastCGI script not found\n",
+        ));
+    }
+    let mut params = vec![
+        ("GATEWAY_INTERFACE".into(), "CGI/1.1".into()),
+        ("SERVER_SOFTWARE".into(), "multi-server".into()),
+        ("SERVER_PROTOCOL".into(), format!("{:?}", parts.version)),
+        ("REQUEST_METHOD".into(), parts.method.to_string()),
+        ("REQUEST_URI".into(), parts.uri.to_string()),
+        ("DOCUMENT_URI".into(), parts.uri.path().into()),
+        (
+            "QUERY_STRING".into(),
+            parts.uri.query().unwrap_or_default().into(),
+        ),
+        ("SCRIPT_NAME".into(), script_name),
+        (
+            "SCRIPT_FILENAME".into(),
+            script_filename.to_string_lossy().into_owned(),
+        ),
+        ("DOCUMENT_ROOT".into(), root.to_string_lossy().into_owned()),
+        ("SERVER_NAME".into(), site.domain.clone()),
+        ("SERVER_PORT".into(), "80".into()),
+        ("REMOTE_ADDR".into(), "127.0.0.1".into()),
+        ("CONTENT_LENGTH".into(), body.len().to_string()),
+        ("REDIRECT_STATUS".into(), "200".into()),
+    ];
+    for (name, value) in &parts.headers {
+        let Ok(value) = value.to_str() else { continue };
+        if name == header::CONTENT_TYPE {
+            params.push(("CONTENT_TYPE".into(), value.into()));
+        } else if name != header::CONTENT_LENGTH {
+            params.push((
+                format!(
+                    "HTTP_{}",
+                    name.as_str().to_ascii_uppercase().replace('-', "_")
+                ),
+                value.into(),
+            ));
+        }
+    }
+    if parts
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
+    {
+        params.push(("HTTPS".into(), "on".into()));
+        params.push(("SERVER_PORT".into(), "443".into()));
+    }
+    let mut stream = tokio::net::TcpStream::connect((upstream.host.as_str(), upstream.port))
+        .await
+        .context("failed to connect FastCGI upstream")?;
+    write_fastcgi_record(&mut stream, 1, &[0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    let encoded_params = encode_fastcgi_params(&params);
+    for chunk in encoded_params.chunks(u16::MAX as usize) {
+        write_fastcgi_record(&mut stream, 4, chunk).await?;
+    }
+    write_fastcgi_record(&mut stream, 4, &[]).await?;
+    for chunk in body.chunks(u16::MAX as usize) {
+        write_fastcgi_record(&mut stream, 5, chunk).await?;
+    }
+    write_fastcgi_record(&mut stream, 5, &[]).await?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    loop {
+        let mut header = [0_u8; 8];
+        stream.read_exact(&mut header).await?;
+        if header[0] != 1 || u16::from_be_bytes([header[2], header[3]]) != 1 {
+            bail!("invalid FastCGI response");
+        }
+        let content_length = u16::from_be_bytes([header[4], header[5]]) as usize;
+        let padding_length = header[6] as usize;
+        let mut content = vec![0; content_length];
+        stream.read_exact(&mut content).await?;
+        if padding_length > 0 {
+            let mut padding = vec![0; padding_length];
+            stream.read_exact(&mut padding).await?;
+        }
+        match header[1] {
+            3 => break,
+            6 => stdout.extend_from_slice(&content),
+            7 => stderr.extend_from_slice(&content),
+            _ => {}
+        }
+        if stdout.len() > site.manifest.limits.stdio_output_bytes {
+            bail!("FastCGI response exceeded its output limit");
+        }
+    }
+    if !stderr.is_empty() {
+        warn!(domain = %site.domain, message = %String::from_utf8_lossy(&stderr), "FastCGI stderr");
+    }
+    parse_cgi_response(&stdout)
+}
+
+async fn write_fastcgi_record(
+    stream: &mut tokio::net::TcpStream,
+    record_type: u8,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let padding = (8 - content.len() % 8) % 8;
+    let length = content.len() as u16;
+    stream
+        .write_all(&[
+            1,
+            record_type,
+            0,
+            1,
+            (length >> 8) as u8,
+            length as u8,
+            padding as u8,
+            0,
+        ])
+        .await?;
+    stream.write_all(content).await?;
+    if padding > 0 {
+        stream.write_all(&[0; 8][..padding]).await?;
+    }
+    Ok(())
+}
+
+fn encode_fastcgi_params(params: &[(String, String)]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for (name, value) in params {
+        encode_fastcgi_length(name.len(), &mut encoded);
+        encode_fastcgi_length(value.len(), &mut encoded);
+        encoded.extend_from_slice(name.as_bytes());
+        encoded.extend_from_slice(value.as_bytes());
+    }
+    encoded
+}
+
+fn encode_fastcgi_length(length: usize, output: &mut Vec<u8>) {
+    if length < 128 {
+        output.push(length as u8);
+    } else {
+        output.extend_from_slice(&((length as u32) | 0x8000_0000).to_be_bytes());
+    }
 }
 
 fn parse_cgi_response(output: &[u8]) -> anyhow::Result<Response<Body>> {
@@ -665,19 +889,58 @@ fn parse_cgi_response(output: &[u8]) -> anyhow::Result<Response<Body>> {
 }
 
 async fn start_process(site: &ResolvedSite) -> anyhow::Result<(Upstream, Child, Option<String>)> {
-    let Serve::Http {
+    let (
         command,
         environment,
         working_directory,
-        port_environment,
         port,
+        port_environment,
         upstream_host,
         startup_timeout_seconds,
         readiness,
         network,
-    } = &site.manifest.serve
-    else {
-        bail!("not an HTTP service");
+    ) = match &site.manifest.serve {
+        Serve::Http {
+            command,
+            environment,
+            working_directory,
+            port_environment,
+            port,
+            upstream_host,
+            startup_timeout_seconds,
+            readiness,
+            network,
+        } => (
+            command,
+            environment,
+            working_directory,
+            port.as_ref(),
+            port_environment,
+            upstream_host,
+            startup_timeout_seconds,
+            readiness,
+            network,
+        ),
+        Serve::Fastcgi {
+            command,
+            environment,
+            working_directory,
+            port_environment,
+            upstream_host,
+            startup_timeout_seconds,
+            ..
+        } => (
+            command,
+            environment,
+            working_directory,
+            None,
+            port_environment,
+            upstream_host,
+            startup_timeout_seconds,
+            &TCP_READINESS,
+            &HOST_NETWORK,
+        ),
+        _ => bail!("serve mode does not start a persistent process"),
     };
     let selected_port = match port {
         Some(port) => *port,
@@ -1173,5 +1436,14 @@ mod tests {
         assert_eq!(parse_byte_range("bytes=-10", 100), Some((90, 99)));
         assert_eq!(parse_byte_range("bytes=100-", 100), None);
         assert_eq!(parse_byte_range("bytes=0-1,3-4", 100), None);
+    }
+
+    #[test]
+    fn encodes_fastcgi_parameter_lengths() {
+        let encoded = encode_fastcgi_params(&[("A".into(), "B".repeat(130))]);
+        assert_eq!(encoded[0], 1);
+        assert_eq!(&encoded[1..5], &[0x80, 0, 0, 130]);
+        assert_eq!(encoded[5], b'A');
+        assert_eq!(encoded.len(), 5 + 1 + 130);
     }
 }

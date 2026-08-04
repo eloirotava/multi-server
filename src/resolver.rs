@@ -8,6 +8,7 @@ use crate::manifest::Manifest;
 pub struct ResolvedSite {
     pub domain: String,
     pub directory: PathBuf,
+    pub runtime_key: PathBuf,
     pub manifest: Manifest,
 }
 
@@ -46,6 +47,7 @@ async fn load_site(
     }
     Ok(Some(ResolvedSite {
         domain: domain.into(),
+        runtime_key: directory.clone(),
         directory,
         manifest,
     }))

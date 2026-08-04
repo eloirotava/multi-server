@@ -12,6 +12,8 @@ pub struct Manifest {
     pub domains: Domains,
     pub serve: Serve,
     #[serde(default)]
+    pub routes: Vec<Route>,
+    #[serde(default)]
     pub prepare: Vec<Vec<String>>,
     #[serde(default)]
     pub lifecycle: Lifecycle,
@@ -64,6 +66,46 @@ pub enum Serve {
         #[serde(default = "default_request_timeout")]
         timeout_seconds: u64,
     },
+    Fastcgi {
+        command: Vec<String>,
+        #[serde(default)]
+        environment: HashMap<String, String>,
+        #[serde(default)]
+        working_directory: Option<String>,
+        #[serde(default = "default_port_environment")]
+        port_environment: String,
+        #[serde(default = "default_upstream_host")]
+        upstream_host: String,
+        #[serde(default = "default_startup_timeout")]
+        startup_timeout_seconds: u64,
+        #[serde(default = "default_public")]
+        document_root: String,
+        #[serde(default = "default_front_controller")]
+        front_controller: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    pub serve: Serve,
+}
+
+impl Route {
+    pub fn matches(&self, path: &str) -> bool {
+        self.path_prefix
+            .as_ref()
+            .is_some_and(|prefix| path.starts_with(prefix))
+            || self.extensions.iter().any(|extension| {
+                path.rsplit_once('.').is_some_and(|(_, actual)| {
+                    actual.eq_ignore_ascii_case(extension.trim_start_matches('.'))
+                })
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -144,12 +186,19 @@ impl Manifest {
         if manifest.version != 1 {
             bail!("unsupported manifest version {}", manifest.version);
         }
-        let command = match &manifest.serve {
-            Serve::Http { command, .. } | Serve::Stdio { command, .. } => Some(command),
-            Serve::Static { .. } => None,
-        };
-        if command.is_some_and(Vec::is_empty) {
-            bail!("serve.command cannot be empty");
+        validate_serve(&manifest.serve)?;
+        for route in &manifest.routes {
+            if route.path_prefix.is_none() && route.extensions.is_empty() {
+                bail!("routes require path_prefix, extensions, or both");
+            }
+            if route
+                .path_prefix
+                .as_ref()
+                .is_some_and(|path| !path.starts_with('/'))
+            {
+                bail!("route path_prefix must start with /");
+            }
+            validate_serve(&route.serve)?;
         }
         if manifest.prepare.iter().any(Vec::is_empty) {
             bail!("prepare commands cannot be empty");
@@ -189,6 +238,29 @@ impl Manifest {
     }
 }
 
+fn validate_serve(serve: &Serve) -> anyhow::Result<()> {
+    let command = match serve {
+        Serve::Http { command, .. }
+        | Serve::Stdio { command, .. }
+        | Serve::Fastcgi { command, .. } => Some(command),
+        Serve::Static { .. } => None,
+    };
+    if command.is_some_and(Vec::is_empty) {
+        bail!("serve.command cannot be empty");
+    }
+    if let Serve::Fastcgi {
+        document_root,
+        front_controller,
+        ..
+    } = serve
+    {
+        if document_root.is_empty() || front_controller.is_empty() {
+            bail!("FastCGI document_root and front_controller cannot be empty");
+        }
+    }
+    Ok(())
+}
+
 const fn manifest_version() -> u32 {
     1
 }
@@ -203,6 +275,9 @@ fn default_port_environment() -> String {
 }
 fn default_upstream_host() -> String {
     "127.0.0.1".into()
+}
+fn default_front_controller() -> String {
+    "index.php".into()
 }
 const fn default_startup_timeout() -> u64 {
     15
@@ -274,5 +349,21 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn route_matches_prefixes_and_extensions() {
+        let route = Route {
+            path_prefix: Some("/assets/".into()),
+            extensions: vec!["css".into(), ".JS".into()],
+            serve: Serve::Static {
+                root: "public".into(),
+                index: vec!["index.html".into()],
+            },
+        };
+        assert!(route.matches("/assets/no-extension"));
+        assert!(route.matches("/theme.CSS"));
+        assert!(route.matches("/app.js"));
+        assert!(!route.matches("/blog/post"));
     }
 }
