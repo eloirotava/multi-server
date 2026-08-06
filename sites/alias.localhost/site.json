@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "site_root": "../static.localhost",
+  "domains": {
+    "aliases": ["www.alias.localhost", "shared-static.localhost"]
+  },
+  "serve": {
+    "mode": "static",
+    "root": "public",
+    "index": ["index.html"]
+  }
+}

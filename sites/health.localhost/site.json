@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "serve": {
+    "mode": "http",
+    "command": ["python3", "app.py"],
+    "readiness": {
+      "mode": "http",
+      "path": "/ready",
+      "status": 204
+    },
+    "startup_timeout_seconds": 10
+  },
+  "lifecycle": {
+    "idle_timeout_seconds": 20
+  }
+}

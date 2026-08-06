@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "domains": {
+    "subdomains": true
+  },
+  "routes": [
+    {
+      "extensions": [
+        "css", "js", "mjs", "map", "jpg", "jpeg", "png", "gif", "webp",
+        "svg", "ico", "woff", "woff2", "ttf", "mp4", "webm"
+      ],
+      "serve": {
+        "mode": "static",
+        "root": "public",
+        "index": ["index.html"]
+      }
+    }
+  ],
+  "serve": {
+    "mode": "fastcgi",
+    "command": ["php-cgi", "-b", "127.0.0.1:${PORT}"],
+    "document_root": "public",
+    "front_controller": "index.php",
+    "startup_timeout_seconds": 15
+  },
+  "lifecycle": {
+    "idle_timeout_seconds": 60,
+    "shutdown_grace_seconds": 10
+  },
+  "limits": {
+    "request_body_bytes": 67108864,
+    "stdio_output_bytes": 16777216,
+    "max_concurrent_requests": 16
+  }
+}

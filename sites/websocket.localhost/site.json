@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "prepare": [
+    ["python3", "-m", "venv", ".venv"],
+    [".venv/bin/pip", "install", "-r", "requirements.txt"]
+  ],
+  "serve": {
+    "mode": "http",
+    "command": [
+      ".venv/bin/uvicorn", "app:app",
+      "--host", "127.0.0.1",
+      "--port", "${PORT}"
+    ],
+    "readiness": {
+      "mode": "http",
+      "path": "/health",
+      "status": 204
+    }
+  },
+  "lifecycle": {
+    "idle_timeout_seconds": 30
+  }
+}

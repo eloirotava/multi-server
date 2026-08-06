@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "serve": {
+    "mode": "http",
+    "command": ["python3", "app.py"]
+  },
+  "lifecycle": {
+    "idle_timeout_seconds": 15,
+    "activity_paths": ["/hls/", "/publish/"]
+  }
+}

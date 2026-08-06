@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "serve": {
+    "mode": "http",
+    "command": ["python3", "app.py"],
+    "environment": { "SITE_NAME": "${DOMAIN}" },
+    "port": 8080,
+    "network": { "mode": "namespace" }
+  },
+  "lifecycle": { "idle_timeout_seconds": 20 }
+}

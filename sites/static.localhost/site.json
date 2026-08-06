@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "serve": {
+    "mode": "static",
+    "root": "public",
+    "index": ["index.html"]
+  }
+}

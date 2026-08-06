@@ -1,0 +1,4 @@
+target/
+*.log
+.venv/
+__pycache__/
